@@ -32,8 +32,9 @@ public sealed partial class PlayerWindow : Window
     private bool DocumentDirty => cleanDocument != (songTitle.Text, bpm.Text, score.Text, gap.Text);
     private void UpdateDocumentTitle()
     {
-        Title = $"口琴简谱播放器 0.4.0 — {songTitle.Text}{(DocumentDirty ? " *" : "")}";
+        Title = $"口琴简谱播放器 0.5.0 — {songTitle.Text}{(DocumentDirty ? " *" : "")}";
         documentInfo.Text = documentPath ?? "尚未保存";
+        UpdatePlaylistStatus();
     }
     private void MarkDocumentClean() { cleanDocument = (songTitle.Text, bpm.Text, score.Text, gap.Text); UpdateDocumentTitle(); }
     private readonly TextBox score = new() { AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Height = 230, Text = "1234567 【1234567】 （1234567） #1 #2 #4 #5 #6 111 000" };
@@ -51,6 +52,7 @@ public sealed partial class PlayerWindow : Window
     private string? scoreIssue, hotkeyIssue, operationIssue;
     private int? errorPosition, operationErrorPosition;
     private bool operationIsRuntime;
+    private string? playbackReleaseError;
     private long playbackGeneration;
     private bool uiBusy;
     private readonly Button locateError = new() { Content = "定位曲谱错误", Margin = new Thickness(4) };
@@ -58,11 +60,13 @@ public sealed partial class PlayerWindow : Window
     private void UpdateAvailability()
     {
         bool blockedByHotkey = dry.IsChecked != true && hotkeys?.StopReady != true;
-        start.IsEnabled = !uiBusy && scoreIssue == null && !blockedByHotkey;
-        startReason.Text = scoreIssue != null ? "无法开始：请先修正曲谱或速度、音符间隔。" :
+        bool otherSelected = playlist.SelectedId != null && playlist.SelectedId != playlist.CurrentId;
+        start.IsEnabled = !uiBusy && (scoreIssue == null || otherSelected) && !blockedByHotkey;
+        startReason.Text = scoreIssue != null && !otherSelected ? "无法开始：请先修正曲谱或速度、音符间隔。" :
             blockedByHotkey ? "无法开始游戏演奏：请先修复停止快捷键。" : "";
         locateError.IsEnabled = !uiBusy && (errorPosition ?? operationErrorPosition) != null;
         listen.IsEnabled = listenFromCursor.IsEnabled = exportMidi.IsEnabled = !uiBusy && scoreIssue == null;
+        UpdatePlaylistAvailability();
     }
     private void LocateError()
     {
@@ -109,7 +113,7 @@ public sealed partial class PlayerWindow : Window
         scoreDialogs = dialogs ?? new ScoreDialogs();
         localAudio = audioPlayer ?? new LocalAudioPlayer();
         settingsPath = settingsFile ?? SettingsStore.DefaultPath;
-        Title = "口琴简谱播放器 0.4.0"; Width = 740; Height = 900; MinWidth = 600; MinHeight = 600;
+        Title = "口琴简谱播放器 0.5.0"; Width = 740; Height = 900; MinWidth = 600; MinHeight = 600;
         var panel = new StackPanel { Margin = new Thickness(18) };
         var root = new DockPanel { Margin = new Thickness(8) };
         var fixedHeader = new StackPanel();
@@ -142,6 +146,7 @@ public sealed partial class PlayerWindow : Window
         fileControls.Children.Add(newScore); fileControls.Children.Add(saveScore); fileControls.Children.Add(saveAs); fileControls.Children.Add(importMidi);
         panel.Children.Add(fileControls);
         AddListeningControls(panel);
+        AddPlaylistControls(panel);
         panel.Children.Add(new TextBlock { Text = "曲名（与文件名独立）：" });
         panel.Children.Add(songTitle); panel.Children.Add(documentInfo); panel.Children.Add(documentWarning);
         var shortcuts = new StackPanel { Orientation = Orientation.Horizontal };
@@ -210,6 +215,7 @@ public sealed partial class PlayerWindow : Window
             if (closing) return;
             if (documentBusy) { ReportIssue("正在读写曲谱，请完成后再关闭。"); return; }
             closing = true;
+            playlistSwitchCancellation?.Cancel();
             saveTimer.Stop(); previewTimer.Stop();
             cancellation?.Cancel(); // Cancel first; do not put disk I/O before it.
             SetBusy(true); stop.IsEnabled = false;
@@ -224,7 +230,7 @@ public sealed partial class PlayerWindow : Window
     {
         try
         {
-            Task? playback = running;
+            Task? playback = playbackCompletion?.Task ?? running;
             if (playback != null)
             {
                 if (await Task.WhenAny(playback, Task.Delay(1500)) != playback)
@@ -232,6 +238,7 @@ public sealed partial class PlayerWindow : Window
                 try { await playback; }
                 catch (Exception e) { status.Text = "演奏结束异常：" + e.Message; }
             }
+            if (playlistSwitchCompletion != null) await playlistSwitchCompletion.Task;
             // No background note sender remains before final cleanup begins.
             string? releaseError = await Task.Run(output.Release);
             if (releaseError != null)
@@ -277,6 +284,12 @@ public sealed partial class PlayerWindow : Window
                 key == settings.Start.Key && modifiers == settings.Start.Modifiers) _ = Begin(key);
             if (!editingHotkeys && w.ToInt32() == 2 && hotkeys?.StopReady == true &&
                 key == settings.Stop.Key && modifiers == settings.Stop.Modifiers) Stop();
+            if (!editingHotkeys && w.ToInt32() == 3 && hotkeys?.PreviousReady == true &&
+                settings.Previous is { } previous && key == previous.Key && modifiers == previous.Modifiers)
+                _ = NavigatePlaylistAsync(-1, key);
+            if (!editingHotkeys && w.ToInt32() == 4 && hotkeys?.NextReady == true &&
+                settings.Next is { } next && key == next.Key && modifiers == next.Modifiers)
+                _ = NavigatePlaylistAsync(1, key);
             handled = true;
         }
         return IntPtr.Zero;
@@ -310,24 +323,25 @@ public sealed partial class PlayerWindow : Window
     }
     private void ApplyHotkeys()
     {
-        if (hotkeys == null || cancellation != null || closing || beginning || editingHotkeys || documentBusy) return;
-        hotkeys.Apply(settings.Start, settings.Stop);
+        if (hotkeys == null || cancellation != null || closing || beginning || editingHotkeys || documentBusy || playlistSwitching) return;
+        hotkeys.Apply(settings.Start, settings.Stop, settings.Previous, settings.Next);
         UpdateMode(); stop.Content = "停止 " + settings.Stop.Label;
-        hotkeyStatus.Text = hotkeys.Describe(settings.Start, settings.Stop);
-        hotkeyIssue = hotkeys.StartReady && hotkeys.StopReady ? null :
+        hotkeyStatus.Text = hotkeys.Describe(settings.Start, settings.Stop, settings.Previous, settings.Next);
+        hotkeyIssue = hotkeys.StartReady && hotkeys.StopReady &&
+            (settings.Previous == null || hotkeys.PreviousReady) && (settings.Next == null || hotkeys.NextReady) ? null :
             hotkeyStatus.Text + "\n常见原因：其他播放器、录屏或键盘工具占用了热键。点击“自定义快捷键”换一个组合，或关闭占用程序后点“重试注册”。管理员权限不能解除热键占用。";
         UpdateAlert();
     }
     private void ConfigureHotkeys()
     {
-        if (hotkeys == null || cancellation != null || closing || beginning || editingHotkeys || documentBusy) return;
+        if (hotkeys == null || cancellation != null || closing || beginning || editingHotkeys || documentBusy || playlistSwitching) return;
         editingHotkeys = true; hotkeys.Suspend();
         try
         {
-            var dialog = new HotkeyDialog(settings.Start, settings.Stop) { Owner = this };
+            var dialog = new HotkeyDialog(settings.Start, settings.Stop, settings.Previous, settings.Next) { Owner = this };
             if (dialog.ShowDialog() == true)
             {
-                settings = settings with { Start = dialog.Start, Stop = dialog.Stop };
+                settings = settings with { Start = dialog.Start, Stop = dialog.Stop, Previous = dialog.Previous, Next = dialog.Next };
                 _ = SaveCurrentSettingsAsync(true);
             }
         }
@@ -348,7 +362,7 @@ public sealed partial class PlayerWindow : Window
     }
     private async Task DocumentOperation(Func<Task<bool>> action)
     {
-        if (cancellation != null || beginning || editingHotkeys || closing || documentBusy) return;
+        if (cancellation != null || beginning || editingHotkeys || closing || documentBusy || playlistSwitching) return;
         documentBusy = true; SetBusy(true);
         try { await action(); }
         catch (Exception e) { ReportIssue("曲谱操作失败：" + e.Message); }
@@ -368,13 +382,14 @@ public sealed partial class PlayerWindow : Window
         status.Text = scoreIssue == null ? "已导入，检查通过；请确认速度（BPM）。" : "已导入，请修正顶部提示的错误。";
         return true;
     });
-    private void ApplyDocument(ScoreDocument document)
+    private void ApplyDocument(ScoreDocument document, Guid? playlistId = null)
     {
+        playlist.SetCurrent(playlistId);
         documentPath = document.SourcePath; legacyDocument = document.IsLegacy;
         extraHeaders = document.ExtraHeaders ?? Array.Empty<string>();
         songTitle.Text = document.Title; bpm.Text = document.Bpm.ToString(); score.Text = document.ScoreText;
         gap.Text = document.Gap.ToString();
-        documentWarning.Text = ""; operationIssue = null; MarkDocumentClean(); Preview();
+        documentWarning.Text = ""; operationIssue = null; MarkDocumentClean(); Preview(); RefreshPlaylistView();
     }
     private async Task<bool> ConfirmUnsavedAsync()
     {
@@ -402,6 +417,9 @@ public sealed partial class PlayerWindow : Window
             }
             await ScoreDocumentWriter.SaveAsync(path, document, gap.Text);
             documentPath = Path.GetFullPath(path); legacyDocument = false;
+            if (playlist.CurrentId is Guid currentId)
+                playlist.UpdateDocument(currentId, document with { SourcePath = documentPath, IsLegacy = false });
+            RefreshPlaylistView();
             documentWarning.Text = string.Join("\n", ScoreDocumentReader.Parse(
                 ScoreDocumentWriter.Serialize(document, gap.Text), documentPath, document.Bpm).Warnings);
             MarkDocumentClean(); operationIssue = null; UpdateAlert();
@@ -413,32 +431,77 @@ public sealed partial class PlayerWindow : Window
     private void Stop()
     {
         if (closing) return; // Shutdown owns final input cleanup; do not race it.
+        playlistSwitchCancellation?.Cancel();
         cancellation?.Cancel();
         if (cancellation != null) status.Text = listening ? "正在停止试听…" : "正在停止并释放输入…";
-        else { var error = output.Release(); status.Text = error ?? "已停止。"; if (error != null) ReportIssue("释放按键失败：" + error, runtime: true); }
+        else { var error = output.Release(); playbackReleaseError = error; status.Text = error ?? "已停止。"; if (error != null) ReportIssue("释放按键失败：" + error, runtime: true); }
     }
-    private async Task Begin(uint triggerKey = 0)
+    private Task Begin(uint triggerKey = 0) => StartGamePlayback(triggerKey, true);
+    private Task StartGamePlayback(uint triggerKey, bool useSelection)
     {
-        if (cancellation != null || closing || beginning || editingHotkeys || documentBusy) return;
+        if (cancellation != null || closing || beginning || editingHotkeys || documentBusy || playlistSwitching) return Task.CompletedTask;
+        var owned = new CancellationTokenSource(); cancellation = owned;
+        playbackCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         beginning = true; ++playbackGeneration; SetBusy(true);
         operationIssue = null; UpdateAlert();
+        Guid? selected = useSelection ? playlist.SelectedId : null;
+        running = PlaySequenceAsync(triggerKey, selected, owned, playbackCompletion);
+        return running;
+    }
+    private async Task PlaySequenceAsync(uint triggerKey, Guid? selected, CancellationTokenSource owned, TaskCompletionSource completion)
+    {
+        // Publish the owning task before a synchronous validation failure can finish.
+        await Task.Yield();
+        var token = owned.Token;
+        bool loadingSelection = false;
         try
         {
-            var notes = ScoreParser.Parse(score.Text);
-            double ms = Timing();
-            int silence = ValidateGap(notes, ms);
-            scoreIssue = null; errorPosition = null; UpdateAlert();
+            if (selected is Guid id)
+            {
+                loadingSelection = id != playlist.CurrentId;
+                if (loadingSelection && !await LoadPlaylistEntryAsync(id, token))
+                { status.Text = "已取消加载，保持停止。"; return; }
+                loadingSelection = false;
+                playlist.ConsumeSelection(id); RefreshPlaylistView();
+            }
+            token.ThrowIfCancellationRequested();
             bool simulation = dry.IsChecked == true;
             if (!simulation && hotkeys?.StopReady != true)
                 throw new InvalidOperationException($"停止键 {settings.Stop.Label} 不可用，禁止真实演奏。请点击“自定义快捷键”或“重试注册”。");
-            cancellation = new CancellationTokenSource();
-            if (closing || cancellation.IsCancellationRequested) return;
             _ = SaveCurrentSettingsAsync();
             SetBusy(true); log.Clear();
-            running = Run(notes, ms, silence, simulation, triggerKey, cancellation.Token);
-            await running;
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var notes = ScoreParser.Parse(score.Text);
+                double ms = Timing(); int silence = ValidateGap(notes, ms);
+                scoreIssue = null; errorPosition = null; UpdateAlert();
+                ++playbackGeneration;
+                if (!await Run(notes, ms, silence, simulation, triggerKey, token)) break;
+                ++playbackGeneration; // Discard the completed song's queued progress while loading the next.
+                token.ThrowIfCancellationRequested();
+                var advance = await playlist.AdvanceAsync(DocumentDirty, token);
+                ShowPlaylistSkips(advance.Skipped); RefreshPlaylistView();
+                if (advance.BlockedByEdits) { status.Text = "当前曲目有未保存修改，连续播放已停止，请先保存或处理修改。"; break; }
+                if (advance.Entry == null || advance.Score == null)
+                {
+                    if (playlist.CurrentId != null) status.Text = "播放列表已结束。";
+                    break;
+                }
+                token.ThrowIfCancellationRequested();
+                ApplyDocument(advance.Score.Document, advance.Entry.Id);
+                documentWarning.Text = string.Join("\n", advance.Score.Warnings);
+                triggerKey = 0; // Every song still goes through Run's three-second countdown.
+            }
         }
-        catch (FormatException) { Preview(); status.Text = "无法开始，请查看顶部提示。"; }
+        catch (OperationCanceledException) { if (!closing) status.Text = "已停止。"; }
+        catch (FormatException e)
+        {
+            // A location in an unloaded file must never select unrelated editor text.
+            if (loadingSelection) ReportIssue($"预选曲目无法加载（{playlist.Find(selected)?.Path}）：{e.Message}");
+            else operationIssue = null; // Preview below owns current editor validation.
+            status.Text = "无法开始，请查看顶部提示。";
+        }
         catch (Exception e)
         {
             status.Text = "无法开始，请查看顶部提示。";
@@ -447,8 +510,9 @@ public sealed partial class PlayerWindow : Window
         }
         finally
         {
-            cancellation?.Cancel(); // Invalidate queued progress from the completed run.
-            cancellation?.Dispose(); cancellation = null; running = null; beginning = false; SetBusy(false);
+            owned.Cancel(); owned.Dispose(); // Invalidate queued progress from the completed run.
+            cancellation = null; running = null; beginning = false; SetBusy(false); Preview();
+            completion.TrySetResult();
         }
     }
     private int ValidateGap(List<ScoreNote> notes, double ms)
@@ -480,7 +544,7 @@ public sealed partial class PlayerWindow : Window
     }
     private void SetBusy(bool busy)
     {
-        busy |= closing || documentBusy;
+        busy |= closing || documentBusy || playlistSwitching;
         uiBusy = busy;
         import.IsEnabled = importMidi.IsEnabled = refresh.IsEnabled = gap.IsEnabled = dry.IsEnabled = !busy;
         bpm.IsEnabled = !busy;
@@ -490,10 +554,10 @@ public sealed partial class PlayerWindow : Window
         saveScore.IsEnabled = saveAs.IsEnabled = newScore.IsEnabled = !busy;
         UpdateAlert();
     }
-    private async Task Run(List<ScoreNote> notes, double ms, int silence, bool simulation, uint triggerKey, CancellationToken token)
+    private async Task<bool> Run(List<ScoreNote> notes, double ms, int silence, bool simulation, uint triggerKey, CancellationToken token)
     {
         string result = simulation ? "测试完成：未操作游戏，也未发声。需要游戏演奏请取消“仅测试”。" : "演奏完成。";
-        bool failed = false;
+        bool failed = false, released = true;
         PlaybackTimingException? timingFailure = null;
         string playbackBody = score.Text;
         long generation = playbackGeneration;
@@ -542,7 +606,7 @@ public sealed partial class PlayerWindow : Window
                     int index = i;
                     Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
                     {
-                        if (closing || token.IsCancellationRequested) return;
+                    if (closing || token.IsCancellationRequested || playbackGeneration != generation) return;
                         status.Text = $"{index + 1}/{notes.Count}：{note.Label} / {note.Beats:0.###}拍";
                         if (log.LineCount > 150) log.Clear();
                         log.AppendText($"{begin:0}ms  {note.Label}  {note.Beats:0.###}拍 ({noteMs:0.##}ms)\n"); log.ScrollToEnd();
@@ -568,6 +632,8 @@ public sealed partial class PlayerWindow : Window
         {
             // 工作任务已退出，再做最终释放，避免释放之后仍有旧任务按键。
             var error = simulation ? null : await Task.Run(output.Release);
+            playbackReleaseError = error;
+            released = error == null;
             if (!closing)
             {
                 status.Text = error == null ? result : result + " 释放失败，请手动按下并松开相关键：" + error;
@@ -584,5 +650,6 @@ public sealed partial class PlayerWindow : Window
                 }
             }
         }
+        return !failed && released && !token.IsCancellationRequested;
     }
 }

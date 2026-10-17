@@ -45,7 +45,17 @@ public sealed record MidiImportProblem(int NoteNumber, double TimeMs, string Mes
 {
     public override string ToString() => $"第 {NoteNumber} 音 · {TimeMs / 1000:0.###} 秒：{Message}";
 }
-public sealed record MidiConversion(ScoreDocument? Document, IReadOnlyList<MidiImportProblem> Problems)
+public enum MidiMelodyStrategy { Highest, Lowest }
+public sealed record MidiConversionReport(int SourceNotes, int KeptNotes, int ChordNotesDropped,
+    int ShortNotesDropped, int ShortenedNotes, int OctaveAdjustedNotes, int Transpose,
+    IReadOnlyList<string> IgnoredEffects, IReadOnlyList<MidiImportProblem> Adjustments)
+{
+    public string Summary => $"原始 {SourceNotes} 音 → 保留 {KeptNotes} 音；舍弃 {ChordNotesDropped + ShortNotesDropped} 音" +
+        $"（和弦取舍 {ChordNotesDropped}、过短 {ShortNotesDropped}）；截短 {ShortenedNotes} 音；" +
+        $"八度调整 {OctaveAdjustedNotes} 音；整体移调 {Transpose:+0;-0;0} 半音。";
+}
+public sealed record MidiConversion(ScoreDocument? Document, IReadOnlyList<MidiImportProblem> Problems,
+    MidiConversionReport? Report = null)
 {
     public bool Success => Document != null && Problems.Count == 0;
 }
@@ -121,7 +131,9 @@ public static class MidiImporter
                     if (count > end - reader.BaseStream.Position) throw new FormatException("MIDI 事件数据长度越界。");
                     return reader.ReadBytes(count);
                 }
-                var active = new Dictionary<(int Channel, int Pitch), long>();
+                // Repeated Note On messages pair with Note Off in arrival order. Keep
+                // separate attacks; chord/overlap reduction belongs to conversion.
+                var active = new Dictionary<(int Channel, int Pitch), Queue<long>>();
                 var notes = new Dictionary<int, List<MidiSourceNote>>();
                 void Unsupported(int channel, string issue)
                 {
@@ -168,8 +180,7 @@ public static class MidiImporter
                     if (status is 0xF0 or 0xF7)
                     {
                         running = 0; Data(Variable());
-                        // SysEx can change tuning or articulation; do not silently claim exact conversion.
-                        globalUnsupported.Add("包含 SysEx，本版不能保证调音/演奏效果，请先导出纯音符 MIDI。");
+                        globalUnsupported.Add("已忽略 SysEx 的调音/演奏效果。");
                         continue;
                     }
                     if (status is < 0x80 or >= 0xF0) throw new FormatException("MIDI 包含不支持的事件状态。");
@@ -180,20 +191,24 @@ public static class MidiImporter
                     if (a > 127 || b > 127) throw new FormatException("MIDI 通道事件数据无效。");
                     if (kind == 0x90 && b > 0)
                     {
-                        if (!active.TryAdd((channel, a), tick))
-                            throw new FormatException($"第 {trackIndex + 1} 轨、通道 {channel + 1} 存在同音重叠，无法明确配对，当前仅支持严格单音。");
+                        if (!active.TryGetValue((channel, a), out var starts)) active[(channel, a)] = starts = new();
+                        starts.Enqueue(tick);
                     }
                     else if (kind == 0x80 || (kind == 0x90 && b == 0))
                     {
-                        if (!active.Remove((channel, a), out long start))
+                        if (!active.TryGetValue((channel, a), out var starts))
                             throw new FormatException($"第 {trackIndex + 1} 轨、通道 {channel + 1} 存在未配对的 Note Off。");
+                        long start = starts.Dequeue();
+                        if (starts.Count == 0) active.Remove((channel, a));
                         if (!notes.TryGetValue(channel, out var list)) notes[channel] = list = new();
                         list.Add(new(a, start, tick));
                     }
                     else if (kind == 0xE0 && ((b << 7) | a) != 8192)
-                        Unsupported(channel, "包含弯音，当前仅支持固定音高，请先移除弯音后导入。");
+                        Unsupported(channel, "已忽略弯音，使用 Note On 的固定音高。");
                     else if (kind == 0xB0 && ((a == 64 && b >= 64) || a is 66 or 69 or 120 or 123))
-                        Unsupported(channel, "包含延音/保持踏板或全部音符关闭事件，请先导出纯音符 MIDI。");
+                        Unsupported(channel, "已忽略踏板/通道关闭控制效果，按 Note On / Note Off 计算时长。");
+                    else if (kind is 0xB0 or 0xC0 or 0xD0 or 0xA0)
+                        Unsupported(channel, "已忽略音色、表情或其他控制效果。");
                 }
                 if (!ended) throw new FormatException($"第 {trackIndex + 1} 轨缺少结束事件。");
                 if (active.Count != 0) throw new FormatException($"第 {trackIndex + 1} 轨有音符缺少 Note Off，未自动补全。");
@@ -241,15 +256,16 @@ public static class MidiImporter
         return new(best, original, Coverage(best), part.Notes.Count);
     }
 
-    public static MidiConversion Convert(MidiImportFile file, MidiImportPart part, int bpm, int gap, int transpose = 0)
+    public static MidiConversion Convert(MidiImportFile file, MidiImportPart part, int bpm, int gap, int transpose = 0,
+        MidiMelodyStrategy strategy = MidiMelodyStrategy.Highest)
     {
         PlaybackValidation.ParseBpm(bpm.ToString(CultureInfo.InvariantCulture));
         PlaybackValidation.ParseGap(gap.ToString(CultureInfo.InvariantCulture));
         if (transpose is < -127 or > 127) throw new FormatException("移调范围为 -127～127 半音。");
+        if (!Enum.IsDefined(strategy)) throw new FormatException("未知的和弦取音方式。");
         var problems = new List<MidiImportProblem>();
         void Problem(int i, double time, string message) => problems.Add(new(i + 1, time, message));
         if (part.Channel == 9) Problem(0, 0, "打击乐通道不能作为单旋律口琴导入。");
-        foreach (string issue in file.Unsupported.Concat(part.Unsupported).Distinct()) Problem(0, 0, issue);
         if (part.Notes.Count > 20000)
         {
             Problem(0, 0, "音符超过 20000，无法生成本版谱面。");
@@ -260,38 +276,88 @@ public static class MidiImporter
             Problem(0, 0, "所选轨道过长，无法在 20000 个音/休止和每段 64 拍的限制内转换。");
             return new(null, problems.AsReadOnly());
         }
-        for (int i = 0; i < part.Notes.Count; i++)
-        {
-            var n = part.Notes[i]; double start = file.Milliseconds(n.StartTick), end = file.Milliseconds(n.EndTick);
-            if (n.EndTick <= n.StartTick) Problem(i, start, "音长不大于零，未自动修改。");
-            if (i > 0 && n.StartTick < part.Notes[i - 1].EndTick)
-                Problem(i, start, "检测到重叠/复音，当前只支持严格单音；未截短或丢弃音符。");
-            if (!HarmonicaPitchMap.Contains(n.Pitch + transpose))
-                Problem(i, start, $"移调后的 MIDI 音高 {n.Pitch + transpose}（原音 {HarmonicaPitchMap.Name(n.Pitch)}）超出 {HarmonicaPitchMap.Lowest}～{HarmonicaPitchMap.Highest}，请调整整体移调。");
-            if (end - start < PlaybackValidation.PreparationMs + 40 - 0.000001)
-                Problem(i, start, $"原始发声时长 {end - start:0.###}ms 不足 12ms 准备＋40ms 按住，请在原 MIDI 调整；未自动延长。");
-            double next = i + 1 < part.Notes.Count ? file.Milliseconds(part.Notes[i + 1].StartTick) : file.Milliseconds(part.EndTick);
-            if (next - end < gap - 0.000001)
-                Problem(i, start, $"音尾到{(i + 1 < part.Notes.Count ? "下一音" : "所选轨道结束")}仅 {next - end:0.###}ms，无法容纳 gap={gap}ms；可减小 gap（最低 10ms），或在原 MIDI 调整，未自动缩短音长。");
-            if ((end - start + gap) * bpm / 60000.0 > 64)
-                Problem(i, start, "单音时值超过 64 拍，请选用更低的固定 BPM 或在原 MIDI 拆分。");
-        }
         if (part.Notes.Count == 0) Problem(0, 0, "所选轨道/通道没有音符。");
         if (problems.Count > 0) return new(null, problems.AsReadOnly());
+        var adjustments = new List<MidiImportProblem>();
+        void Adjust(int index, double time, string message) => adjustments.Add(new(index + 1, time, message));
+        int chords = 0, shortNotes = 0, shortened = 0, folded = 0;
+        var candidates = new List<(MidiSourceNote Note, int Index)>();
+        foreach (var group in part.Notes.Select((note, index) => (Note: note, Index: index))
+            .GroupBy(n => n.Note.StartTick).OrderBy(g => g.Key))
+        {
+            var chosen = group.OrderBy(n => strategy == MidiMelodyStrategy.Highest ? -n.Note.Pitch : n.Note.Pitch)
+                .ThenByDescending(n => n.Note.EndTick).ThenBy(n => n.Index).First();
+            candidates.Add(chosen);
+            foreach (var other in group.Where(n => n.Index != chosen.Index))
+            {
+                chords++;
+                Adjust(other.Index, file.Milliseconds(other.Note.StartTick),
+                    $"和弦取{(strategy == MidiMelodyStrategy.Highest ? "最高" : "最低")}音：舍弃 MIDI {other.Note.Pitch}，保留 MIDI {chosen.Note.Pitch}。");
+            }
+        }
+        var kept = new List<(int Pitch, double Start, double End)>();
+        double boundary = file.Milliseconds(part.EndTick);
+        // Work backwards: a dropped ornament must not unnecessarily truncate the
+        // preceding note. Later retained attacks always keep their source time.
+        foreach (var candidate in candidates.AsEnumerable().Reverse())
+        {
+            var n = candidate.Note; int i = candidate.Index;
+            double start = file.Milliseconds(n.StartTick), originalEnd = file.Milliseconds(n.EndTick);
+            double end = Math.Min(originalEnd, boundary - gap);
+            if (end - start < PlaybackValidation.PreparationMs + 40 - 0.000001)
+            {
+                shortNotes++;
+                Adjust(i, start, $"舍弃过短音：原时长 {originalEnd - start:0.###}ms，留出 gap 后最多 {Math.Max(0, end - start):0.###}ms，不足 52ms；后续起音不变。");
+                continue;
+            }
+            if ((end - start + gap) * bpm / 60000.0 > 64)
+                Problem(i, start, "单音时值超过 64 拍，请选用更低的固定 BPM 或在原 MIDI 拆分。");
+            if (end < originalEnd - 0.000001)
+            {
+                shortened++;
+                Adjust(i, start, $"音尾截短 {originalEnd - end:0.###}ms，保留起音并留出 gap={gap}ms。");
+            }
+            int pitch = n.Pitch + transpose, beforeFold = pitch;
+            while (pitch < HarmonicaPitchMap.Lowest) pitch += 12;
+            while (pitch > HarmonicaPitchMap.Highest) pitch -= 12;
+            if (pitch != beforeFold)
+            {
+                folded++;
+                Adjust(i, start, $"八度调整：移调后 MIDI {beforeFold} → {pitch}（{(pitch - beforeFold) / 12:+0;-0;0} 八度）。");
+            }
+            kept.Add((pitch, start, end)); boundary = start;
+        }
+        kept.Reverse();
+        var report = new MidiConversionReport(part.Notes.Count, kept.Count, chords, shortNotes, shortened, folded,
+            transpose, file.Unsupported.Concat(part.Unsupported).Distinct().ToArray(),
+            adjustments.OrderBy(a => a.TimeMs).ThenBy(a => a.NoteNumber).ToArray());
+        if (kept.Count == 0) Problem(0, 0, "转换后没有可演奏的音符，请选择其他轨道或减小 gap。");
+        if (problems.Count > 0) return new(null, problems.AsReadOnly(), report);
         var tokens = new List<string>(); double cursor = 0, beatMs = 60000.0 / bpm;
+        static string BeatText(double beats)
+        {
+            string text = beats.ToString("R", CultureInfo.InvariantCulture);
+            // TXT accepts decimals, not exponents. Preserve round-trip precision.
+            return text.Contains('E') || text.Contains('e')
+                ? decimal.Parse(text, NumberStyles.Float, CultureInfo.InvariantCulture).ToString("0.############################", CultureInfo.InvariantCulture)
+                : text;
+        }
         void Rest(double milliseconds)
         {
             double beats = milliseconds / beatMs;
             while (beats > 64) { tokens.Add("0:64"); beats -= 64; }
-            if (beats > 0) tokens.Add("0:" + beats.ToString("0.#################", CultureInfo.InvariantCulture));
+            if (beats > 0) tokens.Add("0:" + BeatText(beats));
         }
-        foreach (var n in part.Notes)
+        foreach (var n in kept)
         {
-            double start = file.Milliseconds(n.StartTick), end = file.Milliseconds(n.EndTick);
-            Rest(Math.Max(0, start - cursor));
-            double beats = (end - start + gap) / beatMs;
-            tokens.Add(HarmonicaPitchMap.Token(n.Pitch + transpose) + ":" + beats.ToString("0.#################", CultureInfo.InvariantCulture));
-            cursor = end + gap;
+            Rest(Math.Max(0, n.Start - cursor));
+            double beats = (n.End - n.Start + gap) / beatMs;
+            // Avoid a floating point roundoff making exactly 52ms fail validation.
+            if (beats * beatMs - gap - PlaybackValidation.PreparationMs < 40)
+                beats = (PlaybackValidation.PreparationMs + 40 + gap) / beatMs;
+            while (beats * beatMs - gap - PlaybackValidation.PreparationMs < 40) beats = Math.BitIncrement(beats);
+            tokens.Add(HarmonicaPitchMap.Token(n.Pitch) + ":" + BeatText(beats));
+            cursor = n.End + gap;
         }
         Rest(Math.Max(0, file.Milliseconds(part.EndTick) - cursor));
         string body = string.Join("\n", tokens.Chunk(8).Select(row => string.Join(" ", row)));
@@ -301,7 +367,7 @@ public static class MidiImporter
             document.Validate(gap.ToString(CultureInfo.InvariantCulture));
             ScoreDocumentWriter.Serialize(document, gap.ToString(CultureInfo.InvariantCulture));
         }
-        catch (FormatException e) { return new(null, new[] { new MidiImportProblem(1, 0, e.Message) }); }
-        return new(document, Array.Empty<MidiImportProblem>());
+        catch (FormatException e) { return new(null, new[] { new MidiImportProblem(1, 0, e.Message) }, report); }
+        return new(document, Array.Empty<MidiImportProblem>(), report);
     }
 }

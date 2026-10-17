@@ -32,18 +32,20 @@ public static class ScoreDocumentReader
     private static readonly Regex FileBpm = new(@"(?<![A-Za-z])bpm\s*([+-]?\d+(?:\.\d+)?)(?![\d.])", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     internal static readonly Regex Header = new(@"^@([A-Za-z][A-Za-z0-9_-]*)=(.*)$", RegexOptions.CultureInvariant);
 
-    public static async Task<ScoreReadResult> ReadAsync(string path, int fallbackBpm)
+    public static async Task<ScoreReadResult> ReadAsync(string path, int fallbackBpm, CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         // Bound the bytes actually read, not only FileInfo.Length (file may grow).
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
         using var bytes = new MemoryStream();
         byte[] buffer = new byte[8192];
         int count;
-        while ((count = await stream.ReadAsync(buffer)) != 0)
+        while ((count = await stream.ReadAsync(buffer, token)) != 0)
         {
             if (bytes.Length + count > MaxBytes) throw new IOException("文件不得超过1MB。");
             bytes.Write(buffer, 0, count);
         }
+        token.ThrowIfCancellationRequested();
         return Parse(new UTF8Encoding(false, true).GetString(bytes.ToArray()), path, fallbackBpm);
     }
 

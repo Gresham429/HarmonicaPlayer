@@ -4,6 +4,7 @@ if (args.Contains("--gap-only")) { await GapDocumentTests.Run(); return; }
 if (args.Contains("--playback-timing-only")) { PlaybackTimingTests.Run(); PlaybackGuardTests.Run(); return; }
 if (args.Contains("--pitch-input-only")) { PitchInputTests.Run(); return; }
 if (args.Contains("--midi-import-only")) { MidiImportTests.Run(); return; }
+if (args.Contains("--playlist-only")) { await PlaylistTests.Run(); return; }
 if (args.Length == 2 && args[0] == "--feedback-scores") { await PlaybackGuardTests.CheckFeedback(args[1]); return; }
 if (args.Contains("--sample-audio-only")) { SampleAudioTests.Run(); return; }
 
@@ -190,6 +191,7 @@ PlaybackTimingTests.Run();
 PlaybackGuardTests.Run();
 MidiImportTests.Run();
 PitchInputTests.Run();
+await PlaylistTests.Run();
 
 sealed class FakeHotkeys : IHotkeyBackend
 {

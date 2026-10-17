@@ -7,6 +7,8 @@ public sealed record AppSettings
 {
     public HotkeyBinding Start { get; init; } = HotkeyBinding.DefaultStart;
     public HotkeyBinding Stop { get; init; } = HotkeyBinding.DefaultStop;
+    public HotkeyBinding? Previous { get; init; }
+    public HotkeyBinding? Next { get; init; }
     public int Bpm { get; init; } = 120;
     public int Gap { get; init; } = 20;
     public int PreviewVolume { get; init; } = 60;
@@ -14,7 +16,7 @@ public sealed record AppSettings
     public void Validate()
     {
         if (Start is null || Stop is null) throw new FormatException("缺少快捷键设置。");
-        HotkeyBinding.ValidatePair(Start, Stop);
+        HotkeyBinding.ValidateAll(Start, Stop, Previous, Next);
         if (Bpm is < 20 or > 300 || Gap is < 10 or > 5000 || PreviewVolume is < 0 or > 100)
             throw new FormatException("设置数值超出允许范围。");
     }

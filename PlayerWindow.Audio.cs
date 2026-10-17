@@ -37,7 +37,9 @@ public sealed partial class PlayerWindow
     }
     private async Task ListenAsync(bool fromCursor)
     {
-        if (cancellation != null || closing || beginning || editingHotkeys || documentBusy) return;
+        if (cancellation != null || closing || beginning || editingHotkeys || documentBusy || playlistSwitching) return;
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        playbackCompletion = completion;
         int selectionStart = score.SelectionStart, selectionLength = score.SelectionLength;
         beginning = true; ++playbackGeneration; listening = true; SetBusy(true);
         operationIssue = null; UpdateAlert();
@@ -84,6 +86,7 @@ public sealed partial class PlayerWindow
             running = null; beginning = false; listening = false;
             score.Select(Math.Min(selectionStart, score.Text.Length), Math.Min(selectionLength, score.Text.Length - Math.Min(selectionStart, score.Text.Length)));
             SetBusy(false);
+            completion.TrySetResult();
         }
     }
     private static string Time(double ms) => TimeSpan.FromMilliseconds(ms).TotalHours >= 1

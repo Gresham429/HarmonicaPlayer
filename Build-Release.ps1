@@ -18,7 +18,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Windows UI tests failed. Publishing cancelled.' }
     }
 
-    $version = '0.4.0'
+    $version = '0.5.0'
     $buildStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $outputDir = Join-Path $PSScriptRoot "bin\Release\publish-$version-$buildStamp"
     dotnet publish .\HarmonicaPlayer.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $outputDir
@@ -31,8 +31,8 @@ try {
     Copy-Item .\CONTRIBUTIONS.md $outputDir
     Copy-Item .\THIRD-PARTY-NOTICES.md $outputDir
     Copy-Item .\Assets\Harmonica\LICENSE-CC0.txt $outputDir
-    Copy-Item .\UPDATE-0.4.0.md $outputDir
-    Copy-Item .\VALIDATION-0.4.0.md $outputDir
+    Copy-Item .\UPDATE-0.5.0.md $outputDir
+    Copy-Item .\VALIDATION-0.5.0.md $outputDir
     Copy-Item .\README.md $outputDir
     Copy-Item .\AudioExamples $outputDir -Recurse
     Copy-Item -LiteralPath .\ai转谱模板.txt -Destination $outputDir

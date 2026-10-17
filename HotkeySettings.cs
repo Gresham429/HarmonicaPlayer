@@ -36,10 +36,16 @@ public record HotkeyBinding(uint Key, uint Modifiers = 0)
         return null;
     }
     public static void ValidatePair(HotkeyBinding start, HotkeyBinding stop)
+        => ValidateAll(start, stop, null, null);
+    public static void ValidateAll(HotkeyBinding start, HotkeyBinding stop, HotkeyBinding? previous, HotkeyBinding? next)
     {
-        if (start.Error() is string a) throw new FormatException("开始键：" + a);
-        if (stop.Error() is string b) throw new FormatException("停止键：" + b);
-        if (start == stop) throw new FormatException("开始键和停止键不能相同。");
+        var seen = new HashSet<HotkeyBinding>();
+        foreach (var (label, binding) in new[] { ("开始", start), ("停止", stop), ("上一首", previous), ("下一首", next) })
+        {
+            if (binding == null) continue;
+            if (binding.Error() is string error) throw new FormatException(label + "键：" + error);
+            if (!seen.Add(binding)) throw new FormatException("开始、停止、上一首和下一首的快捷键不能重复。");
+        }
     }
 }
 
@@ -56,21 +62,31 @@ public sealed class HotkeyController(IHotkeyBackend backend)
     public bool StopReady { get; private set; }
     public int StartError { get; private set; }
     public int StopError { get; private set; }
-    public void Apply(HotkeyBinding start, HotkeyBinding stop)
+    public bool PreviousReady { get; private set; }
+    public bool NextReady { get; private set; }
+    public int PreviousError { get; private set; }
+    public int NextError { get; private set; }
+    public void Apply(HotkeyBinding start, HotkeyBinding stop, HotkeyBinding? previous = null, HotkeyBinding? next = null)
     {
-        HotkeyBinding.ValidatePair(start, stop); // Never discard valid registrations for invalid input.
+        HotkeyBinding.ValidateAll(start, stop, previous, next); // Validate before discarding registrations.
         Suspend();
         StopError = backend.Register(2, stop); StopReady = StopError == 0;
         StartError = backend.Register(1, start); StartReady = StartError == 0;
+        PreviousError = previous == null ? 0 : backend.Register(3, previous); PreviousReady = previous != null && PreviousError == 0;
+        NextError = next == null ? 0 : backend.Register(4, next); NextReady = next != null && NextError == 0;
     }
     public void Suspend()
     {
         if (StartReady) backend.Unregister(1);
         if (StopReady) backend.Unregister(2);
-        StartReady = StopReady = false;
+        if (PreviousReady) backend.Unregister(3);
+        if (NextReady) backend.Unregister(4);
+        StartReady = StopReady = PreviousReady = NextReady = false;
     }
-    public string Describe(HotkeyBinding start, HotkeyBinding stop) =>
+    public string Describe(HotkeyBinding start, HotkeyBinding stop, HotkeyBinding? previous = null, HotkeyBinding? next = null) =>
         $"开始 {start.Label}：{Result(StartReady, StartError)}；停止 {stop.Label}：{Result(StopReady, StopError)}。" +
+        $"上一首：{(previous == null ? "未设置" : previous.Label + " " + Result(PreviousReady, PreviousError))}；" +
+        $"下一首：{(next == null ? "未设置" : next.Label + " " + Result(NextReady, NextError))}。" +
         (!StopReady ? "停止键不可用，禁止真实演奏；请修改快捷键或解除占用后点“重试注册”。" :
          !StartReady ? "可点击“开始”按钮演奏；也可修改开始键或重试注册。" : "快捷键已就绪。");
     private static string Result(bool ok, int error) => ok ? "可用" :

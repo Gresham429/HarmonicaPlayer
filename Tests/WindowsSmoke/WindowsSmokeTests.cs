@@ -96,6 +96,7 @@ public static class WindowsSmokeTests
                     }
                 }
                 await MidiImportWindowTests();
+                await PlaylistWindowTests();
                 await SettingsGenerationTests();
                 await PlaybackRestartTests();
                 await DocumentWindowTests();
@@ -216,10 +217,12 @@ public static class WindowsSmokeTests
                 if (!accept.IsEnabled) throw new Exception("Compatible MIDI preview blocked");
                 var fields = Descendants(importDialog).OfType<TextBox>().Where(b => !b.IsReadOnly).ToArray();
                 fields.Single(b => b.Text == "0").Text = "127";
-                if (accept.IsEnabled) throw new Exception("Out-of-range transpose allowed import");
+                if (!accept.IsEnabled) throw new Exception("Octave folding blocked a playable conversion");
+                fields.Single(b => b.Text == "127").Text = "128";
+                if (accept.IsEnabled) throw new Exception("Invalid transpose parameter allowed import");
             }
             finally { if (importDialog.IsVisible) importDialog.Close(); }
-            Console.WriteLine("PASS MIDI-window: cancel, unsaved TXT, source preservation, mode, transpose block");
+            Console.WriteLine("PASS MIDI-window: cancel, unsaved TXT, source preservation, mode, octave folding and parameter validation");
         }
         finally
         {
@@ -239,6 +242,76 @@ public static class WindowsSmokeTests
         public ScoreDocument? ConvertMidi(Window owner, MidiImportFile file) =>
             CancelConversion ? null : MidiImporter.Convert(file, file.Parts.Single(), 120, 10).Document;
         public void PlaybackIssue(Window owner, string message) => throw new Exception("Unexpected runtime stop: " + message);
+    }
+    private static async Task PlaylistWindowTests()
+    {
+        string folder = Path.Combine(Path.GetTempPath(), "HarmonicaPlaylistWindow-" + Guid.NewGuid());
+        Directory.CreateDirectory(folder);
+        string firstPath = Path.Combine(folder, "first.txt"), lastPath = Path.Combine(folder, "last.txt"),
+            badPath = Path.Combine(folder, "bad.txt"), missingPath = Path.Combine(folder, "missing.txt");
+        await ScoreDocumentWriter.SaveAsync(firstPath, new ScoreDocument("首曲", 120, "1:0.2", Gap: 10), "10");
+        await ScoreDocumentWriter.SaveAsync(lastPath, new ScoreDocument("末曲", 120, "5:4", Gap: 10), "10");
+        await File.WriteAllTextAsync(badPath, "8");
+        var dialogs = new TestScoreDialogs { PlaylistPaths = new[] { firstPath, missingPath, badPath, lastPath } };
+        var audio = new FakeLocalAudio();
+        var window = new PlayerWindow(Path.Combine(folder, "settings.json"), dialogs, audioPlayer: audio, administrator: false);
+        try
+        {
+            window.Show(); await WaitUntil(() => window.IsLoaded, "playlist window loaded");
+            Field<CheckBox>(window, "dry").IsChecked = true;
+            var editor = Field<TextBox>(window, "score"); string initial = editor.Text;
+            await Invoke(window, "AddPlaylistFilesAsync");
+            var list = Field<Playlist>(window, "playlist"); var grid = Field<DataGrid>(window, "playlistView");
+            var first = list.Items[0]; var last = list.Items[^1];
+            grid.SelectedItem = first;
+            if (editor.Text != initial || list.CurrentId != null || Field<Task?>(window, "running") != null)
+                throw new Exception("Playlist import/single click changed editor or started playback");
+            await Invoke(window, "SwitchPlaylistAsync", first.Id, false, (uint)0);
+            if (editor.Text != "1:0.2" || list.CurrentId != first.Id || Field<Task?>(window, "running") != null)
+                throw new Exception("Double click failed to load without playing");
+            editor.Text = "2:0.2";
+            await Invoke(window, "Begin", (uint)0).WaitAsync(TimeSpan.FromSeconds(6));
+            if (list.CurrentId != first.Id || editor.Text != "2:0.2" || !Field<TextBlock>(window, "status").Text.Contains("未保存"))
+                throw new Exception("Current editor edits were replaced or did not stop automatic advance");
+            editor.Text = "1:0.2"; // Restore the clean snapshot.
+            var sequence = Invoke(window, "Begin", (uint)0);
+            await WaitUntil(() => list.CurrentId == last.Id && Field<TextBlock>(window, "status").Text.Contains("秒后开始"), "automatic skip and next countdown");
+            if (!Field<TextBox>(window, "playlistIssues").Text.Contains(missingPath) || !Field<TextBox>(window, "playlistIssues").Text.Contains(badPath))
+                throw new Exception("Skipped file reasons were not shown");
+            grid.SelectedItem = list.Find(first.Id);
+            if (list.CurrentId != last.Id || editor.Text != "5:4") throw new Exception("Selection interrupted current song");
+            await Invoke(window, "SwitchPlaylistAsync", first.Id, false, (uint)0);
+            await sequence;
+            if (list.CurrentId != first.Id || Field<Task?>(window, "running") != null || editor.IsReadOnly)
+                throw new Exception("Double click during countdown failed to stop and unlock editor");
+            editor.Text = "3:0.2"; dialogs.Answer = MessageBoxResult.Cancel;
+            var cancelled = Invoke(window, "Begin", (uint)0);
+            await WaitUntil(() => Field<TextBlock>(window, "status").Text.Contains("秒后开始"), "dirty countdown");
+            await Invoke(window, "SwitchPlaylistAsync", last.Id, false, (uint)0); await cancelled;
+            if (editor.Text != "3:0.2" || list.CurrentId != first.Id || Field<Task?>(window, "running") != null)
+                throw new Exception("Cancelled unsaved switch discarded content or resumed playback");
+            dialogs.Answer = MessageBoxResult.No;
+            await Invoke(window, "SwitchPlaylistAsync", first.Id, false, (uint)0);
+            var listen = Invoke(window, "ListenAsync", false);
+            await WaitUntil(() => audio.Active, "single song local preview");
+            audio.Complete(); await listen;
+            if (list.CurrentId != first.Id || Field<Task?>(window, "running") != null)
+                throw new Exception("Local preview advanced playlist");
+            list.Remove(list.Items[1].Id); list.Remove(list.Items[1].Id);
+            var navigation = Invoke(window, "NavigatePlaylistAsync", 1, (uint)0);
+            await WaitUntil(() => list.CurrentId == last.Id && Field<TextBlock>(window, "status").Text.Contains("秒后开始"), "manual next starts from idle");
+            Field<Button>(window, "stop").RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent)); await navigation;
+            if (Field<Task?>(window, "running") != null) throw new Exception("Stop failed during manual next countdown");
+            await Invoke(window, "NavigatePlaylistAsync", 1, (uint)0);
+            if (list.CurrentId != last.Id || Field<Task?>(window, "running") != null) throw new Exception("Last song navigation looped");
+            Console.WriteLine("PASS playlist-window: preselection, double click, latest editor, unsaved stop/cancel, skip, countdown, navigation, local preview");
+        }
+        finally
+        {
+            dialogs.Answer = MessageBoxResult.No;
+            if (window.IsVisible) await CloseWindow(window);
+            Directory.Delete(folder, true);
+        }
     }
     private static async Task SettingsGenerationTests()
     {
@@ -431,11 +504,13 @@ public static class WindowsSmokeTests
 sealed class TestScoreDialogs : IScoreDialogs
 {
     public string? OpenPath, SavePath, MidiPath;
+    public string[] PlaylistPaths = Array.Empty<string>();
     public MessageBoxResult Answer = MessageBoxResult.No;
     public string? Open(Window owner) => OpenPath;
     public string? Save(Window owner, string suggestedName) => SavePath;
     public MessageBoxResult Unsaved(Window owner) => Answer;
     public string? SaveMidi(Window owner, string suggestedName) => MidiPath;
+    public string[] OpenPlaylistTracks(Window owner) => PlaylistPaths;
     public void PlaybackIssue(Window owner, string message) => throw new Exception("Unexpected playback stop: " + message);
 }
 

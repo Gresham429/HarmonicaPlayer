@@ -17,10 +17,29 @@ public interface IScoreDialogs
     string? Save(Window owner, string suggestedName);
     MessageBoxResult Unsaved(Window owner);
     string? SaveMidi(Window owner, string suggestedName) => new ScoreDialogs().SaveMidi(owner, suggestedName);
+    string[] OpenPlaylistTracks(Window owner) => new ScoreDialogs().OpenPlaylistTracks(owner);
+    string? OpenPlaylist(Window owner) => new ScoreDialogs().OpenPlaylist(owner);
+    string? SavePlaylist(Window owner) => new ScoreDialogs().SavePlaylist(owner);
 }
 
 public sealed class ScoreDialogs : IScoreDialogs
 {
+    public string[] OpenPlaylistTracks(Window owner)
+    {
+        var dialog = new OpenFileDialog { Filter = "TXT 简谱|*.txt", Multiselect = true, CheckFileExists = true };
+        return dialog.ShowDialog(owner) == true ? dialog.FileNames : Array.Empty<string>();
+    }
+    public string? OpenPlaylist(Window owner)
+    {
+        var dialog = new OpenFileDialog { Filter = "HarmonicaPlayer 播放列表|*.hpl", CheckFileExists = true };
+        return dialog.ShowDialog(owner) == true ? dialog.FileName : null;
+    }
+    public string? SavePlaylist(Window owner)
+    {
+        var dialog = new SaveFileDialog { Filter = "HarmonicaPlayer 播放列表|*.hpl", DefaultExt = ".hpl",
+            AddExtension = true, OverwritePrompt = true, FileName = "播放列表.hpl" };
+        return dialog.ShowDialog(owner) == true ? dialog.FileName : null;
+    }
     public string? Open(Window owner)
     {
         var dialog = new OpenFileDialog { Filter = "TXT 简谱|*.txt" };

@@ -9,9 +9,13 @@ public sealed class HotkeyDialog : Window
 {
     private readonly BindingEditor startEditor;
     private readonly BindingEditor stopEditor;
+    private readonly BindingEditor previousEditor;
+    private readonly BindingEditor nextEditor;
     public HotkeyBinding Start => startEditor.Value;
     public HotkeyBinding Stop => stopEditor.Value;
-    public HotkeyDialog(HotkeyBinding start, HotkeyBinding stop)
+    public HotkeyBinding? Previous => previousEditor.Value.Key == 0 ? null : previousEditor.Value;
+    public HotkeyBinding? Next => nextEditor.Value.Key == 0 ? null : nextEditor.Value;
+    public HotkeyDialog(HotkeyBinding start, HotkeyBinding stop, HotkeyBinding? previous = null, HotkeyBinding? next = null)
     {
         Title = "自定义快捷键"; Width = 540; SizeToContent = SizeToContent.Height;
         ResizeMode = ResizeMode.NoResize; WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -19,7 +23,10 @@ public sealed class HotkeyDialog : Window
         panel.Children.Add(new TextBlock { Text = "点击录入框后按下快捷键，或用下拉框和勾选项设置。\n修改期间暂停全局快捷键，关闭此窗口后重新注册。", TextWrapping = TextWrapping.Wrap });
         startEditor = new BindingEditor("开始快捷键", start);
         stopEditor = new BindingEditor("停止快捷键", stop);
+        previousEditor = new BindingEditor("上一首（可不设置）", previous, true);
+        nextEditor = new BindingEditor("下一首（可不设置）", next, true);
         panel.Children.Add(startEditor); panel.Children.Add(stopEditor);
+        panel.Children.Add(previousEditor); panel.Children.Add(nextEditor);
         panel.Children.Add(new TextBlock { Text = "停止建议使用容易按到的单键。F12、Win组合及演奏键Z/X/C/V/B/N/M/逗号不支持。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 10) });
         var error = new TextBlock { TextWrapping = TextWrapping.Wrap };
         panel.Children.Add(error);
@@ -27,10 +34,11 @@ public sealed class HotkeyDialog : Window
         var defaults = new Button { Content = "恢复 F6 / F8", Margin = new Thickness(4), Padding = new Thickness(10, 6, 10, 6) };
         var save = new Button { Content = "应用并检查占用", Margin = new Thickness(4), Padding = new Thickness(10, 6, 10, 6) };
         var cancel = new Button { Content = "取消", IsCancel = true, Margin = new Thickness(4), Padding = new Thickness(10, 6, 10, 6) };
-        defaults.Click += (_, _) => { startEditor.Set(HotkeyBinding.DefaultStart); stopEditor.Set(HotkeyBinding.DefaultStop); error.Text = ""; };
+        defaults.Click += (_, _) => { startEditor.Set(HotkeyBinding.DefaultStart); stopEditor.Set(HotkeyBinding.DefaultStop);
+            previousEditor.Set(null); nextEditor.Set(null); error.Text = ""; };
         save.Click += (_, _) =>
         {
-            try { HotkeyBinding.ValidatePair(Start, Stop); DialogResult = true; }
+            try { HotkeyBinding.ValidateAll(Start, Stop, Previous, Next); DialogResult = true; }
             catch (FormatException e) { error.Text = e.Message; }
         };
         row.Children.Add(defaults); row.Children.Add(save); row.Children.Add(cancel); panel.Children.Add(row);
@@ -47,15 +55,16 @@ public sealed class HotkeyDialog : Window
         private readonly TextBlock hint = new() { TextWrapping = TextWrapping.Wrap };
         public HotkeyBinding Value => new((key.SelectedItem as Choice)?.Key ?? 0,
             (ctrl.IsChecked == true ? 2u : 0u) | (alt.IsChecked == true ? 1u : 0u) | (shift.IsChecked == true ? 4u : 0u));
-        public BindingEditor(string label, HotkeyBinding binding)
+        public BindingEditor(string label, HotkeyBinding? binding, bool optional = false)
         {
             Margin = new Thickness(0, 12, 0, 0);
             Children.Add(new TextBlock { Text = label, FontWeight = FontWeights.Bold });
             Children.Add(capture);
             var choices = Enumerable.Range(0x70, 11).Concat(Enumerable.Range(0x30, 10))
                 .Concat(Enumerable.Range(0x41, 26)).Concat(new[] { 0x1B, 0x20, 0x24, 0x23, 0x21, 0x22, 0x2D, 0x2E });
-            key.ItemsSource = choices.Where(k => k is not (0x5A or 0x58 or 0x43 or 0x56 or 0x42 or 0x4E or 0x4D))
-                .Select(k => new Choice((uint)k, HotkeyBinding.KeyName((uint)k))).ToArray();
+            key.ItemsSource = (optional ? new[] { 0 }.Concat(choices) : choices)
+                .Where(k => k is not (0x5A or 0x58 or 0x43 or 0x56 or 0x42 or 0x4E or 0x4D))
+                .Select(k => new Choice((uint)k, k == 0 ? "未设置" : HotkeyBinding.KeyName((uint)k))).ToArray();
             var row = new StackPanel { Orientation = Orientation.Horizontal };
             row.Children.Add(key); row.Children.Add(ctrl); row.Children.Add(alt); row.Children.Add(shift);
             Children.Add(row); Children.Add(hint);
@@ -74,14 +83,20 @@ public sealed class HotkeyDialog : Window
             };
             Set(binding);
         }
-        public void Set(HotkeyBinding value)
+        public void Set(HotkeyBinding? value)
         {
+            value ??= new(0);
             key.SelectedItem = key.Items.Cast<Choice>().FirstOrDefault(c => c.Key == value.Key);
             ctrl.IsChecked = (value.Modifiers & 2) != 0;
             alt.IsChecked = (value.Modifiers & 1) != 0;
             shift.IsChecked = (value.Modifiers & 4) != 0;
             Refresh();
         }
-        private void Refresh() { capture.Text = Value.Label; hint.Text = ""; }
+        private void Refresh()
+        {
+            bool enabled = Value.Key != 0;
+            ctrl.IsEnabled = alt.IsEnabled = shift.IsEnabled = enabled;
+            capture.Text = enabled ? Value.Label : "未设置"; hint.Text = "";
+        }
     }
 }
