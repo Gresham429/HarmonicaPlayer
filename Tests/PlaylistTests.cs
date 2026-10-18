@@ -85,6 +85,45 @@ static class PlaylistTests
             await Reject(() => PlaylistStore.SaveAsync(folder, list.Items), "write failure returned without claiming success");
             Check(Directory.GetFiles(folder, "*.tmp").Length == 0, "failed write cleans temp");
 
+            string library = Path.Combine(folder, "nested", ScoreLibrary.FolderName);
+            string jay = Path.Combine(library, "周杰伦"), lia = Path.Combine(library, "Lia");
+            Directory.CreateDirectory(jay); Directory.CreateDirectory(lia);
+            string sunny = Path.Combine(jay, "晴天 bpm67.txt"), rice = Path.Combine(jay, "稻香.txt"),
+                bird = Path.Combine(lia, "鸟之诗 bpm86.txt"), loose = Path.Combine(library, "散曲.txt");
+            foreach (string file in new[] { sunny, rice, bird, loose }) await File.WriteAllTextAsync(file, "1 2 3");
+            await File.WriteAllTextAsync(Path.Combine(jay, "备注.txtx"), "not a score");
+            string exeFolder = Path.Combine(folder, "nested", "bin", "Release", "net8.0-windows");
+            Directory.CreateDirectory(exeFolder);
+            Check(ScoreLibrary.FindFolder(exeFolder) == Path.GetFullPath(library), "library found from a source-build output folder");
+            Check(ScoreLibrary.FindFolder(exeFolder, 1) == null, "library search depth is bounded");
+            var scanned = ScoreLibrary.Scan(library);
+            Check(scanned.Count == 4, "scan finds TXT in artist folders and root only");
+            var order = scanned.Select(e => e.Artist).ToArray();
+            Check(order[^1] == ScoreLibrary.Unsorted && order.Distinct().Count() == 3 &&
+                order.Select((a, i) => i == 0 || a == order[i - 1] || !order[..i].Contains(a)).All(x => x),
+                "artists contiguous with unsorted last: " + string.Join(",", order));
+            Check(scanned.Where(e => e.Artist == "周杰伦").Select(e => Path.GetFileName(e.Path)).SequenceEqual(new[] { "稻香.txt", "晴天 bpm67.txt" }), "songs sorted by name within artist");
+            Check(ScoreLibrary.ArtistFor(library, next) == ScoreLibrary.Outside && ScoreLibrary.ArtistFor(null, sunny) == ScoreLibrary.Outside, "files outside library are grouped as other");
+            Check(ScoreLibrary.ArtistFor(library, Path.Combine(jay, "sub", "x.txt")) == "周杰伦", "deeper folders belong to first-level artist");
+
+            var grouped = new Playlist();
+            var g1 = grouped.Add(sunny, 120, "周杰伦"); var g2 = grouped.Add(bird, 120, "Lia"); var g3 = grouped.Add(rice, 120, "周杰伦");
+            Check(grouped.Items.Select(e => e.Id).SequenceEqual(new[] { g1.Id, g3.Id, g2.Id }), "added song joins the end of its artist group");
+            grouped.SetCurrent(g3.Id);
+            Check(grouped.Neighbor(1)?.Id == g2.Id, "navigation crosses artist groups in display order");
+            grouped.Move(g3.Id, 1);
+            Check(grouped.Items[1].Id == g3.Id, "move never leaves the artist group");
+            grouped.Move(g3.Id, -1);
+            Check(grouped.Items[0].Id == g3.Id, "move works inside the artist group");
+            Check((await grouped.ReadAsync(g1.Id, default)).Document.Bpm == 67 && grouped.Find(g1.Id)!.Artist == "周杰伦", "metadata refresh keeps artist");
+            grouped.Replace(new[] { g1, g2, g3 });
+            Check(grouped.Items.Select(e => e.Id).SequenceEqual(new[] { g1.Id, g3.Id, g2.Id }), "opened list keeps artists contiguous");
+            string groupedList = Path.Combine(folder, "grouped.hpl");
+            await PlaylistStore.SaveAsync(groupedList, grouped.Items);
+            Check((await PlaylistStore.ReadAsync(groupedList)).Select(e => e.Artist).SequenceEqual(new[] { "周杰伦", "周杰伦", "Lia" }), "artist survives list save");
+            await File.WriteAllTextAsync(groupedList, "{\"Format\":\"HarmonicaPlayer.Playlist/1\",\"Items\":[{\"Path\":\"" + bird.Replace("\\", "\\\\") + "\",\"Title\":\"鸟之诗\",\"Bpm\":86,\"Gap\":20}]}");
+            Check((await PlaylistStore.ReadAsync(groupedList, library)).Single().Artist == "Lia", "v0.5.0 list without artist derives it from the library");
+
             var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var release = new TaskCompletionSource<ScoreReadResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             int reads = 0;

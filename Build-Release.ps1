@@ -42,11 +42,17 @@ try {
         if (Test-Path -LiteralPath '.\简谱' -PathType Container) {
             $scoreOutputDir = Join-Path $outputDir '简谱'
             New-Item -ItemType Directory -Path $scoreOutputDir -Force | Out-Null
-            $scoreFiles = @(Get-ChildItem -LiteralPath '.\简谱' -File -Filter '*.txt')
+            # 歌手子文件夹按原相对路径复制，播放器据此分组。
+            $scoreRoot = (Resolve-Path -LiteralPath '.\简谱').Path
+            $scoreFiles = @(Get-ChildItem -LiteralPath $scoreRoot -File -Filter '*.txt' -Recurse)
             if ($scoreFiles.Count -eq 0) {
                 Write-Warning '简谱文件夹内没有TXT曲谱。'
             } else {
-                $scoreFiles | Copy-Item -Destination $scoreOutputDir -Force
+                foreach ($file in $scoreFiles) {
+                    $target = Join-Path $scoreOutputDir $file.FullName.Substring($scoreRoot.Length).TrimStart('\')
+                    New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+                    Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+                }
             }
         } else {
             Write-Warning '未找到简谱文件夹，本次仅打包内置示例谱。'

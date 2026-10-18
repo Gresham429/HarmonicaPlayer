@@ -107,13 +107,13 @@ public sealed partial class PlayerWindow : Window
     private readonly Button retry = new() { Content = "重试注册", Margin = new Thickness(5), Padding = new Thickness(10, 6, 10, 6) };
     private readonly Button stop = new() { Content = "停止 F8", Margin = new Thickness(5), Padding = new Thickness(15, 6, 15, 6) };
 
-    public PlayerWindow(string? settingsFile = null, IScoreDialogs? dialogs = null, Action<AppSettings>? writeSettings = null, ILocalAudioPlayer? audioPlayer = null, bool? administrator = null)
+    public PlayerWindow(string? settingsFile = null, IScoreDialogs? dialogs = null, Action<AppSettings>? writeSettings = null, ILocalAudioPlayer? audioPlayer = null, bool? administrator = null, bool loadScoreLibrary = false)
     {
         this.administrator = administrator ?? DetectAdministrator();
         scoreDialogs = dialogs ?? new ScoreDialogs();
         localAudio = audioPlayer ?? new LocalAudioPlayer();
         settingsPath = settingsFile ?? SettingsStore.DefaultPath;
-        Title = "口琴简谱播放器 0.5.0"; Width = 740; Height = 900; MinWidth = 600; MinHeight = 600;
+        Title = "口琴简谱播放器 0.5.0"; Width = 1180; Height = 900; MinWidth = 900; MinHeight = 600;
         var panel = new StackPanel { Margin = new Thickness(18) };
         var root = new DockPanel { Margin = new Thickness(8) };
         var fixedHeader = new StackPanel();
@@ -136,7 +136,17 @@ public sealed partial class PlayerWindow : Window
         status.Margin = new Thickness(12, 4, 12, 8);
         fixedHeader.Children.Add(status);
         DockPanel.SetDock(fixedHeader, Dock.Top); root.Children.Add(fixedHeader);
-        root.Children.Add(new ScrollViewer { Content = panel }); Content = root;
+        // Playlist on the left (fills the height), editor and controls on the right.
+        var body = new Grid();
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(360), MinWidth = 260 });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 500 });
+        var playlistPanel = BuildPlaylistPanel();
+        var splitter = new GridSplitter { Width = 5, HorizontalAlignment = HorizontalAlignment.Stretch, Background = Brushes.Gainsboro };
+        var editorScroll = new ScrollViewer { Content = panel };
+        Grid.SetColumn(splitter, 1); Grid.SetColumn(editorScroll, 2);
+        body.Children.Add(playlistPanel); body.Children.Add(splitter); body.Children.Add(editorScroll);
+        root.Children.Add(body); Content = root;
         panel.Children.Add(new TextBlock { Text = "TXT → 单音口琴演奏", FontSize = 23 });
         panel.Children.Add(new TextBlock { Text = "【高音】 （低音） 【【1】】最高do、【【#1】】升半音；5:1.25指定总拍数；#或＃升半音；0休止，-或—延长一拍，_半拍，__四分之一拍，.附点。例：1 2_ 3_ 5 — | 0 6. 5_ 1 |", Margin = new Thickness(0, 10, 0, 10), TextWrapping = TextWrapping.Wrap });
         var controls = new WrapPanel { Orientation = Orientation.Horizontal };
@@ -146,7 +156,6 @@ public sealed partial class PlayerWindow : Window
         fileControls.Children.Add(newScore); fileControls.Children.Add(saveScore); fileControls.Children.Add(saveAs); fileControls.Children.Add(importMidi);
         panel.Children.Add(fileControls);
         AddListeningControls(panel);
-        AddPlaylistControls(panel);
         panel.Children.Add(new TextBlock { Text = "曲名（与文件名独立）：" });
         panel.Children.Add(songTitle); panel.Children.Add(documentInfo); panel.Children.Add(documentWarning);
         var shortcuts = new StackPanel { Orientation = Orientation.Horizontal };
@@ -201,6 +210,8 @@ public sealed partial class PlayerWindow : Window
         dry.Checked += (_, _) => UpdateAlert();
         dry.Unchecked += (_, _) => UpdateAlert();
         SetBusy(false); Preview();
+        // Only the real app scans 简谱; window tests start with an empty list.
+        if (loadScoreLibrary) Loaded += async (_, _) => await ReloadLibraryAsync(true);
         SourceInitialized += (_, _) =>
         {
             hwnd = new WindowInteropHelper(this).Handle;
@@ -216,7 +227,7 @@ public sealed partial class PlayerWindow : Window
             if (documentBusy) { ReportIssue("正在读写曲谱，请完成后再关闭。"); return; }
             closing = true;
             playlistSwitchCancellation?.Cancel();
-            saveTimer.Stop(); previewTimer.Stop();
+            saveTimer.Stop(); previewTimer.Stop(); libraryRefreshTimer.Stop();
             cancellation?.Cancel(); // Cancel first; do not put disk I/O before it.
             SetBusy(true); stop.IsEnabled = false;
             status.Text = "正在停止演奏并关闭…";
@@ -252,7 +263,7 @@ public sealed partial class PlayerWindow : Window
             if (await Task.WhenAny(save, Task.Delay(1500)) != save)
                 status.Text = "正在保存最后的设置，请稍候（窗口仍可响应）…";
             await save;
-            hotkeys?.Suspend(); source?.RemoveHook(Hook);
+            hotkeys?.Suspend(); source?.RemoveHook(Hook); StopWatchingLibrary();
             allowClose = true; Close();
         }
         catch (Exception e) { status.Text = "关闭未完成，请重试：" + e.Message; ReportIssue(status.Text); }

@@ -26,7 +26,7 @@ public static class SingleInstance
         {
             using var signal = new EventWaitHandle(false, EventResetMode.AutoReset, scope + ".Activate");
             var app = new Application();
-            var window = new PlayerWindow();
+            var window = new PlayerWindow(loadScoreLibrary: true);
             var registration = ThreadPool.RegisterWaitForSingleObject(signal, (_, _) =>
             {
                 try

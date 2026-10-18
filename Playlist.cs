@@ -1,11 +1,12 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json;
 
 namespace HarmonicaPlayer;
 
-public sealed record PlaylistEntry(Guid Id, string Path, string Title, int Bpm, int Gap, string? Issue = null);
+public sealed record PlaylistEntry(Guid Id, string Path, string Title, int Bpm, int Gap, string? Issue = null, string Artist = "");
 public sealed record PlaylistAdvance(PlaylistEntry? Entry, ScoreReadResult? Score,
     IReadOnlyList<string> Skipped, bool BlockedByEdits = false);
 
@@ -33,20 +34,25 @@ public sealed class Playlist
     private int Index(Guid id) => Items.ToList().FindIndex(e => e.Id == id);
     public void Replace(IEnumerable<PlaylistEntry> entries)
     {
-        var next = entries.ToArray();
+        // Keep each artist contiguous (first appearance order) so the grouped
+        // view and previous/next navigation follow the same order.
+        var next = entries.GroupBy(e => e.Artist).SelectMany(g => g).ToArray();
         if (next.Length > MaxEntries || next.Select(e => e.Id).Distinct().Count() != next.Length)
             throw new FormatException($"播放列表最多 {MaxEntries} 项，曲目标识不可重复。");
         Items.Clear(); foreach (var entry in next) Items.Add(entry);
         CurrentId = SelectedId = null;
     }
-    public PlaylistEntry Add(string path, int fallbackBpm)
+    public PlaylistEntry Add(string path, int fallbackBpm, string artist = "")
     {
         if (Items.Count >= MaxEntries) throw new FormatException($"播放列表最多 {MaxEntries} 项。");
         path = System.IO.Path.GetFullPath(path);
         string title = System.IO.Path.GetFileNameWithoutExtension(path);
         if (string.IsNullOrWhiteSpace(title)) title = "未命名曲谱";
-        var item = new PlaylistEntry(Guid.NewGuid(), path, title[..Math.Min(title.Length, 200)], fallbackBpm, 20);
-        Items.Add(item); return item;
+        var item = new PlaylistEntry(Guid.NewGuid(), path, title[..Math.Min(title.Length, 200)], fallbackBpm, 20, Artist: artist);
+        // A new song joins the end of its artist group instead of the list end.
+        int last = Items.ToList().FindLastIndex(e => e.Artist == artist);
+        if (last < 0) Items.Add(item); else Items.Insert(last + 1, item);
+        return item;
     }
     public void Remove(Guid id)
     {
@@ -58,7 +64,9 @@ public sealed class Playlist
     public void Move(Guid id, int offset)
     {
         int index = Index(id), target = index + offset;
-        if (index >= 0 && target >= 0 && target < Items.Count) Items.Move(index, target);
+        // Reordering stays inside the artist group; groups are never split.
+        if (index >= 0 && target >= 0 && target < Items.Count && Items[target].Artist == Items[index].Artist)
+            Items.Move(index, target);
     }
     public void UpdateDocument(Guid id, ScoreDocument document)
     {
@@ -119,12 +127,13 @@ public static class PlaylistStore
 {
     public const string Format = "HarmonicaPlayer.Playlist/1";
     public const int MaxBytes = 1024 * 1024;
-    private sealed record SavedEntry(string Path, string Title, int Bpm, int Gap);
+    // Artist is optional so lists saved by v0.5.0 still open; older readers ignore it.
+    private sealed record SavedEntry(string Path, string Title, int Bpm, int Gap, string? Artist = null);
     private sealed record SavedList(string Format, SavedEntry[] Items);
     public static async Task SaveAsync(string path, IEnumerable<PlaylistEntry> entries)
     {
         string target = Path.GetFullPath(path), directory = Path.GetDirectoryName(target)!;
-        var items = entries.Select(e => new SavedEntry(Path.GetRelativePath(directory, e.Path), e.Title, e.Bpm, e.Gap)).ToArray();
+        var items = entries.Select(e => new SavedEntry(Path.GetRelativePath(directory, e.Path), e.Title, e.Bpm, e.Gap, e.Artist)).ToArray();
         if (items.Length > Playlist.MaxEntries) throw new FormatException("播放列表曲目过多。");
         string json = JsonSerializer.Serialize(new SavedList(Format, items), new JsonSerializerOptions { WriteIndented = true });
         if (Encoding.UTF8.GetByteCount(json) > MaxBytes) throw new FormatException("播放列表文件不得超过 1MB。");
@@ -136,7 +145,7 @@ public static class PlaylistStore
         }
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
-    public static async Task<IReadOnlyList<PlaylistEntry>> ReadAsync(string path)
+    public static async Task<IReadOnlyList<PlaylistEntry>> ReadAsync(string path, string? libraryRoot = null)
     {
         string target = Path.GetFullPath(path), directory = Path.GetDirectoryName(target)!;
         using var stream = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
@@ -158,8 +167,47 @@ public static class PlaylistStore
             if (item == null || string.IsNullOrWhiteSpace(item.Path) || item.Bpm is < 20 or > 300 || item.Gap is < 10 or > 5000)
                 throw new FormatException("播放列表含无效路径、BPM 或间隔。");
             ScoreDocument.ValidateTitle(item.Title);
-            result.Add(new(Guid.NewGuid(), Path.GetFullPath(item.Path, directory), item.Title, item.Bpm, item.Gap));
+            if (item.Artist is { Length: > 200 }) throw new FormatException("播放列表含过长的歌手名。");
+            string full = Path.GetFullPath(item.Path, directory);
+            string artist = string.IsNullOrWhiteSpace(item.Artist) ? ScoreLibrary.ArtistFor(libraryRoot, full) : item.Artist.Trim();
+            result.Add(new(Guid.NewGuid(), full, item.Title, item.Bpm, item.Gap, Artist: artist));
         }
         return result;
     }
+}
+
+// The default library is a "简谱" folder; each first-level subfolder is one
+// artist. Only file locations are used; score files are never modified.
+public static class ScoreLibrary
+{
+    public const string FolderName = "简谱", Unsorted = "未分类", Outside = "其他";
+    private static readonly StringComparer NameOrder = StringComparer.Create(CultureInfo.GetCultureInfo("zh-CN"), true);
+
+    // Release packages keep the folder beside the EXE; a source build runs
+    // from bin\<config>\<tfm>, so parent folders are searched as well.
+    public static string? FindFolder(string startDirectory, int maxLevels = 6)
+    {
+        var directory = new DirectoryInfo(startDirectory);
+        for (int level = 0; directory != null && level <= maxLevels; level++, directory = directory.Parent)
+        {
+            string candidate = Path.Combine(directory.FullName, FolderName);
+            if (Directory.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
+    public static string ArtistFor(string? root, string path)
+    {
+        if (root == null) return Outside;
+        string relative = Path.GetRelativePath(Path.GetFullPath(root), Path.GetFullPath(path));
+        if (relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar) || Path.IsPathRooted(relative)) return Outside;
+        var parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return parts.Length >= 2 ? parts[0] : Unsorted;
+    }
+    // Artists in name order with unsorted files last; songs by file name.
+    public static IReadOnlyList<(string Path, string Artist)> Scan(string root) =>
+        Directory.EnumerateFiles(root, "*.txt", SearchOption.AllDirectories)
+            .Where(p => string.Equals(Path.GetExtension(p), ".txt", StringComparison.OrdinalIgnoreCase))
+            .Select(p => (Path: Path.GetFullPath(p), Artist: ArtistFor(root, p)))
+            .OrderBy(e => e.Artist == Unsorted ? 1 : 0).ThenBy(e => e.Artist, NameOrder)
+            .ThenBy(e => Path.GetFileName(e.Path), NameOrder).ToArray();
 }
