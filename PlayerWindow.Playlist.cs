@@ -23,7 +23,7 @@ public sealed partial class PlayerWindow
     private readonly Button nextSong = new() { Content = "下一首 ⏭", Margin = new Thickness(4), Padding = new Thickness(12, 5, 12, 5) };
     private readonly List<Button> playlistEditButtons = new();
     private ListCollectionView? playlistGroups;
-    private bool playlistSwitching, refreshingPlaylist;
+    private bool playlistSwitching, refreshingPlaylist, playlistRevealPending;
     private string playlistNotice = "";
     private CancellationTokenSource? playlistSwitchCancellation;
     private TaskCompletionSource? playbackCompletion, playlistSwitchCompletion;
@@ -210,14 +210,39 @@ public sealed partial class PlayerWindow
     private void RefreshPlaylistView()
     {
         refreshingPlaylist = true;
-        try
-        {
-            var selected = playlist.Find(playlist.SelectedId);
-            playlistView.SelectedItem = selected;
-            if (selected != null && playlistGroups?.Contains(selected) == true) playlistView.ScrollIntoView(selected);
-        }
+        try { playlistView.SelectedItem = playlist.Find(playlist.SelectedId); }
         finally { refreshingPlaylist = false; }
+        RevealPlaylistFocus();
         UpdatePlaylistStatus(); UpdateAvailability();
+    }
+    // Rescans, moves and filtering rebuild the rows and reset the scroll position.
+    // After layout settles, bring the preselected (else current) song back into
+    // view, expanding its artist group if it was collapsed.
+    private void RevealPlaylistFocus()
+    {
+        if (playlistRevealPending) return;
+        playlistRevealPending = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            playlistRevealPending = false;
+            var target = playlist.Find(playlist.SelectedId) ?? playlist.Find(playlist.CurrentId);
+            if (closing || target == null || playlistGroups?.Contains(target) != true) return;
+            var group = playlistGroups.Groups?.OfType<CollectionViewGroup>().FirstOrDefault(g => g.Items.Contains(target));
+            if (group != null && playlistView.ItemContainerGenerator.ContainerFromItem(group) is GroupItem container &&
+                FindDescendant<Expander>(container) is { IsExpanded: false } expander)
+            { expander.IsExpanded = true; playlistView.UpdateLayout(); }
+            playlistView.ScrollIntoView(target);
+        }));
+    }
+    private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+    {
+        for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is T match) return match;
+            if (FindDescendant<T>(child) is T nested) return nested;
+        }
+        return null;
     }
     private void MovePlaylistSelection(int offset)
     {
